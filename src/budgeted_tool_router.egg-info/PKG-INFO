@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: budgeted-tool-router
+Version: 0.1.0
+Summary: Budgeted multi-tool router (BM25 + Qdrant dense) MVP
+Requires-Python: >=3.10

@@ -1,0 +1,10 @@
+.env
+keys
+.venv
+.idea/
+__pycache__/
+*.pyc
+logs/
+artifacts/
+data/*.jsonl
+*.pkl
