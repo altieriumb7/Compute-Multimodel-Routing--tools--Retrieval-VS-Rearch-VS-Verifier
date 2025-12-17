@@ -8,7 +8,8 @@ from qdrant_client.http.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
 
 from toolrouter.config import QdrantConfig
-
+import torch
+from sentence_transformers import SentenceTransformer
 def iter_jsonl(path: str):
     with open(path, "rb") as f:
         for line in f:
@@ -29,7 +30,11 @@ def main():
 
     cfg = QdrantConfig()
     client = QdrantClient(url=cfg.url, api_key=cfg.api_key)
-    embedder = SentenceTransformer(args.model)
+
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    embedder = SentenceTransformer(args.dense_model, device=device)
+    print("SentenceTransformer device:", embedder.device)
 
     try:
         test = embedder.encode(["hello"], normalize_embeddings=True)

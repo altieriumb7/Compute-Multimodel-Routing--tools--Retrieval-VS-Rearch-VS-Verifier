@@ -8,7 +8,8 @@ from toolrouter.io import read_jsonl, write_jsonl
 from toolrouter.tools.bm25 import load_bm25, BM25Tool
 from toolrouter.tools.qdrant_dense import QdrantDenseTool
 from toolrouter.router.actions import DEFAULT_ACTIONS
-
+import torch
+from sentence_transformers import SentenceTransformer
 def wiki_id_from_doc_id(doc_id: str) -> str:
     s = str(doc_id)
     return s.split(":", 1)[0] if ":" in s else s
@@ -28,7 +29,12 @@ def main():
 
     cfg = QdrantConfig()
     client = QdrantClient(url=cfg.url, api_key=cfg.api_key)
-    embedder = SentenceTransformer(args.dense_model)
+
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    embedder = SentenceTransformer(args.dense_model, device=device)
+    print("SentenceTransformer device:", embedder.device)
+
     dense = QdrantDenseTool(client=client, collection=args.qdrant_collection, embedder=embedder)
 
     tools = {"bm25": bm25, "dense": dense}
