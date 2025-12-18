@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Reproducible end-to-end pipeline:
+#   KILT NQ (validation) -> subset Wikipedia corpus -> BM25 + Qdrant -> traces -> router -> eval.
+#
+# Quick start (inside repo):
+#   export QDRANT_URL="https://...:6333"
+#   export QDRANT_API_KEY="..."
+#   bash scripts/run_kilt_nq_repro.sh --install
+#
+# Resume (after a crash/disconnect):
+#   bash scripts/run_kilt_nq_repro.sh
+#
+# Force re-run everything:
+#   bash scripts/run_kilt_nq_repro.sh --force
+
+# ------------------------
+# CLI flags
+# ------------------------
+DO_INSTALL=0
+FORCE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --install) DO_INSTALL=1; shift ;;
+    --force) FORCE=1; shift ;;
+    -h|--help)
+      cat <<'USAGE'
+Usage: bash scripts/run_kilt_nq_repro.sh [--install] [--force]
+
+  --install   Install runtime deps (safe for Colab; avoids reinstalling torch).
+  --force     Rebuild all local artifacts and recreate Qdrant collection.
+USAGE
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# ------------------------
+# Repo root + logging
+# ------------------------
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+mkdir -p logs data artifacts results
+
+LOG="logs/kilt_repro_$(date +%Y%m%d_%H%M%S).log"
+# Mirror stdout/stderr into log (still prints to notebook / terminal)
+exec > >(tee -a "$LOG") 2>&1
+
+echo "[repro] repo_root=$ROOT_DIR"
+echo "[repro] log=$LOG"
+
+echo "[repro] python=$(python -V)"
+
+# ------------------------
+# Load .env if present (optional)
+# ------------------------
+if [[ -f ".env" ]]; then
+  echo "[repro] loading .env"
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
+# ------------------------
+# User-tunable settings (override via env)
+# ------------------------
+: "${KILT_TASK:=nq}"
+: "${KILT_SPLIT:=validation}"
+: "${KILT_MAX_EXAMPLES:=5000}"
+
+: "${WIKI_CONFIG:=2019-08-01}"
+: "${NEG_PAGES:=5000}"
+: "${MAX_PAGES:=20000}"
+: "${MAX_PASSAGES:=200000}"
+
+: "${QDRANT_COLLECTION:=wiki_mini}"
+: "${DENSE_MODEL:=sentence-transformers/all-MiniLM-L6-v2}"
+: "${BUDGET:=1.0}"
+: "${BATCH_SIZE:=256}"
+
+# Device auto-detect unless user set DEVICE
+if [[ -z "${DEVICE:-}" ]]; then
+  DEVICE="$(python - <<'PY'
+import torch
+print('cuda' if torch.cuda.is_available() else 'cpu')
+PY
+)"
+fi
+
+echo "[repro] config: task=$KILT_TASK split=$KILT_SPLIT max_examples=$KILT_MAX_EXAMPLES"
+echo "[repro] wiki: config=$WIKI_CONFIG neg_pages=$NEG_PAGES max_pages=$MAX_PAGES max_passages=$MAX_PASSAGES"
+echo "[repro] qdrant: collection=$QDRANT_COLLECTION"
+echo "[repro] dense: model=$DENSE_MODEL device=$DEVICE batch_size=$BATCH_SIZE"
+echo "[repro] budget: $BUDGET"
+
+# ------------------------
+# Optional dependency install
+# ------------------------
+if [[ "$DO_INSTALL" -eq 1 ]]; then
+  echo "[repro] Installing deps (datasets<4 required for kilt_wikipedia loading script)"
+  python -m pip install -U pip
+  python -m pip install "datasets<4.0.0"
+  # Install runtime deps explicitly, then install this package without deps (keeps Colab CUDA torch)
+  python -m pip install qdrant-client sentence-transformers transformers rank-bm25 scikit-learn tqdm orjson accelerate
+  python -m pip install -e . --no-deps
+fi
+
+# ------------------------
+# Helpers
+# ------------------------
+need_env() {
+  local name="$1"
+  if [[ -z "${!name:-}" ]]; then
+    echo "[repro] Missing $name (env)." >&2
+    exit 3
+  fi
+}
+
+# For Qdrant Cloud we need URL and key (unless scripts are run with flags)
+need_env QDRANT_URL
+need_env QDRANT_API_KEY
+
+echo "[repro] GPU check"
+python -u - <<'PY'
+import torch
+print('cuda:', torch.cuda.is_available())
+if torch.cuda.is_available():
+    print(torch.cuda.get_device_name(0))
+PY
+
+# If forcing, wipe local outputs
+if [[ "$FORCE" -eq 1 ]]; then
+  echo "[repro] --force: deleting local outputs (data/, artifacts/, results/)"
+  rm -f data/kilt_qa.jsonl data/needed_wiki_ids.txt data/kilt_corpus.jsonl
+  rm -rf artifacts/bm25 artifacts/router artifacts/traces_kilt.jsonl results/kilt_metrics.csv
+fi
+
+# ------------------------
+# 1) Prepare QA + needed ids
+# ------------------------
+if [[ ! -s data/kilt_qa.jsonl || ! -s data/needed_wiki_ids.txt ]]; then
+  echo "[repro] Step 1: prepare_kilt_qa"
+  python -u scripts/prepare_kilt_qa.py \
+    --task "$KILT_TASK" \
+    --split "$KILT_SPLIT" \
+    --max_examples "$KILT_MAX_EXAMPLES" \
+    --out data/kilt_qa.jsonl \
+    --needed_ids data/needed_wiki_ids.txt
+else
+  echo "[repro] Step 1: SKIP (QA + needed ids already exist)"
+fi
+
+# ------------------------
+# 2) Build Wikipedia subset corpus
+# ------------------------
+if [[ ! -s data/kilt_corpus.jsonl ]]; then
+  echo "[repro] Step 2: build_kilt_corpus_subset (can take a while)"
+  python -u scripts/build_kilt_corpus_subset.py \
+    --config "$WIKI_CONFIG" \
+    --needed_ids data/needed_wiki_ids.txt \
+    --out data/kilt_corpus.jsonl \
+    --neg_pages "$NEG_PAGES" \
+    --max_pages "$MAX_PAGES" \
+    --max_passages "$MAX_PASSAGES"
+else
+  echo "[repro] Step 2: SKIP (corpus already exists)"
+fi
+
+# Quick summary (helps reproducibility section in paper)
+python -u scripts/check_kilt_state.py || true
+
+# ------------------------
+# 3) Build BM25 index
+# ------------------------
+if [[ ! -d artifacts/bm25 ]]; then
+  echo "[repro] Step 3: build_bm25"
+  python -u scripts/build_bm25.py --corpus data/kilt_corpus.jsonl --out artifacts/bm25
+else
+  echo "[repro] Step 3: SKIP (BM25 index already exists)"
+fi
+
+# ------------------------
+# 4) Ingest Qdrant (GPU embeddings if available)
+# ------------------------
+EXPECTED_DOCS="$(wc -l < data/kilt_corpus.jsonl | tr -d ' ')"
+
+QDRANT_COUNT="$(python - <<PY
+import os
+from qdrant_client import QdrantClient
+url=os.environ['QDRANT_URL']
+key=os.environ.get('QDRANT_API_KEY')
+client=QdrantClient(url=url, api_key=key)
+try:
+    info=client.get_collection(os.environ.get('QDRANT_COLLECTION','${QDRANT_COLLECTION}'))
+    print(getattr(info,'points_count',0))
+except Exception:
+    print(0)
+PY
+)"
+
+echo "[repro] qdrant points_count=${QDRANT_COUNT} expected_docs=${EXPECTED_DOCS}"
+
+RECREATE_FLAG=""
+if [[ "$FORCE" -eq 1 ]]; then
+  RECREATE_FLAG="--recreate"
+fi
+
+if [[ "$QDRANT_COUNT" -lt "$EXPECTED_DOCS" || "$FORCE" -eq 1 ]]; then
+  echo "[repro] Step 4: ingest_qdrant"
+  python -u scripts/ingest_qdrant.py \
+    --qdrant_url "$QDRANT_URL" \
+    --qdrant_api_key "$QDRANT_API_KEY" \
+    --corpus data/kilt_corpus.jsonl \
+    --collection "$QDRANT_COLLECTION" \
+    $RECREATE_FLAG \
+    --batch_size "$BATCH_SIZE" \
+    --dense_model "$DENSE_MODEL" \
+    --device "$DEVICE"
+else
+  echo "[repro] Step 4: SKIP (collection already has enough points)"
+fi
+
+# ------------------------
+# 5) Traces -> train router -> eval
+# ------------------------
+echo "[repro] Step 5a: generate_traces (resumable; safe to rerun)"
+python -u scripts/generate_traces_kilt_resume.py \
+  --qa data/kilt_qa.jsonl \
+  --bm25 artifacts/bm25 \
+  --qdrant_collection "$QDRANT_COLLECTION" \
+  --out artifacts/traces_kilt.jsonl \
+  --budget "$BUDGET" \
+  --dense_model "$DENSE_MODEL" \
+  --device "$DEVICE" \
+  --resume
+
+if [[ ! -d artifacts/router ]]; then
+  echo "[repro] Step 5b: train_router"
+  python -u scripts/train_router.py --traces artifacts/traces_kilt.jsonl --out artifacts/router
+else
+  echo "[repro] Step 5b: SKIP (router already exists)"
+fi
+
+echo "[repro] Step 5c: eval_kilt"
+python -u scripts/eval_kilt.py \
+  --qa data/kilt_qa.jsonl \
+  --bm25 artifacts/bm25 \
+  --qdrant_collection "$QDRANT_COLLECTION" \
+  --router artifacts/router \
+  --budget "$BUDGET" \
+  --dense_model "$DENSE_MODEL" \
+  --out_csv results/kilt_metrics.csv
+
+echo "[repro] DONE. Results:"
+ls -lh results || true
+
+echo "[repro] Log written to: $LOG"
