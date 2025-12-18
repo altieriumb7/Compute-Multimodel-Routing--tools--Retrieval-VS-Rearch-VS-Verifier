@@ -1,16 +1,20 @@
-﻿import argparse
-from tqdm import tqdm
+from __future__ import annotations
+
+import argparse
+import os
+import uuid
+from typing import Any, Dict, Iterable, List
+
 import orjson
+from tqdm import tqdm
 
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams, PointStruct
+from qdrant_client.http import models as qm
 
 from sentence_transformers import SentenceTransformer
 
-from toolrouter.config import QdrantConfig
-import torch
-from sentence_transformers import SentenceTransformer
-def iter_jsonl(path: str):
+
+def iter_jsonl(path: str) -> Iterable[Dict[str, Any]]:
     with open(path, "rb") as f:
         for line in f:
             line = line.strip()
@@ -18,87 +22,132 @@ def iter_jsonl(path: str):
                 continue
             yield orjson.loads(line)
 
+
+def doc_uuid(doc_id: str) -> uuid.UUID:
+    # Deterministic UUID so re-ingesting is idempotent
+    return uuid.uuid5(uuid.NAMESPACE_URL, doc_id)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--collection", required=True)
-    ap.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2")
-    ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--recreate", action="store_true")
-    ap.add_argument("--vector_size", type=int, default=384)
+    ap.add_argument("--batch_size", type=int, default=256)
+
+    ap.add_argument("--dense_model", default="sentence-transformers/all-MiniLM-L6-v2")
+    ap.add_argument("--device", default=None, help="cpu|cuda. Default: auto-detect")
+    ap.add_argument("--max_text_len", type=int, default=1000, help="truncate payload text (0 = keep full)")
+
+    ap.add_argument("--qdrant_url", default=os.environ.get("QDRANT_URL"))
+    ap.add_argument("--qdrant_api_key", default=os.environ.get("QDRANT_API_KEY"))
     args = ap.parse_args()
 
-    cfg = QdrantConfig()
-    client = QdrantClient(url=cfg.url, api_key=cfg.api_key)
+    if not args.qdrant_url:
+        raise SystemExit("Missing QDRANT_URL (env) or --qdrant_url")
 
+    device = args.device
+    if device is None:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[ingest_qdrant] url={args.qdrant_url} collection={args.collection}")
+    print(f"[ingest_qdrant] model={args.dense_model} device={device} batch_size={args.batch_size}")
+
+    client = QdrantClient(url=args.qdrant_url, api_key=args.qdrant_api_key)
+
     embedder = SentenceTransformer(args.dense_model, device=device)
-    print("SentenceTransformer device:", embedder.device)
+    dim = int(embedder.get_sentence_embedding_dimension())
 
-    try:
-        test = embedder.encode(["hello"], normalize_embeddings=True)
-        vec_size = int(test.shape[-1])
-    except Exception:
-        vec_size = args.vector_size
+    vectors_config = qm.VectorParams(size=dim, distance=qm.Distance.COSINE)
 
     if args.recreate:
+        client.recreate_collection(collection_name=args.collection, vectors_config=vectors_config)
+    else:
+        # Create if missing
         try:
-            client.delete_collection(args.collection)
+            exists = client.collection_exists(args.collection)
         except Exception:
-            pass
+            # fallback
+            cols = client.get_collections().collections
+            exists = any(c.name == args.collection for c in cols)
+        if not exists:
+            client.create_collection(collection_name=args.collection, vectors_config=vectors_config)
 
-    if not client.collection_exists(args.collection):
-        client.create_collection(
-            collection_name=args.collection,
-            vectors_config=VectorParams(size=vec_size, distance=Distance.COSINE),
+    batch: List[Dict[str, Any]] = []
+    texts: List[str] = []
+
+    def flush():
+        nonlocal batch, texts
+        if not batch:
+            return
+
+        vecs = embedder.encode(
+            texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
         )
 
-    batch = []
-    texts = []
-    count = 0
-    point_id = 0
+        points: List[qm.PointStruct] = []
+        for rec, v in zip(batch, vecs):
+            doc_id = str(rec["doc_id"])
 
-    for doc in tqdm(iter_jsonl(args.corpus), desc="Embedding+upsert (stream)"):
-        title = str(doc.get("title",""))
-        text = str(doc.get("text",""))
-        payload = {
-            "doc_id": str(doc.get("doc_id", point_id)),
-            "title": title,
-            "text": text,
-            "wikipedia_id": doc.get("wikipedia_id"),
-            "paragraph_id": doc.get("paragraph_id"),
-            "url": doc.get("url",""),
-        }
-        batch.append((point_id, payload, (title + "\n" + text).strip()))
-        point_id += 1
+            title = str(rec.get("title", ""))
+            text = str(rec.get("text", ""))
+
+            if args.max_text_len and args.max_text_len > 0:
+                text = text[: args.max_text_len]
+
+            payload = {
+                "doc_id": doc_id,
+                "title": title,
+                "text": text,
+            }
+
+            points.append(
+                qm.PointStruct(
+                    id=doc_uuid(doc_id),
+                    vector=v.tolist(),
+                    payload=payload,
+                )
+            )
+
+        client.upsert(collection_name=args.collection, points=points, wait=True)
+
+        batch = []
+        texts = []
+
+    pbar = tqdm(desc="Embedding+upsert (stream)", unit="docs")
+    for rec in iter_jsonl(args.corpus):
+        if "doc_id" not in rec:
+            continue
+        t = rec.get("text", "")
+        if not isinstance(t, str):
+            continue
+        t = t.strip()
+        if not t:
+            continue
+
+        batch.append(rec)
+        texts.append(t)
 
         if len(batch) >= args.batch_size:
-            ids = [b[0] for b in batch]
-            payloads = [b[1] for b in batch]
-            ttxt = [b[2] for b in batch]
-            vecs = embedder.encode(ttxt, batch_size=args.batch_size, normalize_embeddings=True)
-            points = [
-                PointStruct(id=i, vector=vecs[j].tolist(), payload=payloads[j])
-                for j, i in enumerate(ids)
-            ]
-            client.upsert(collection_name=args.collection, points=points)
-            count += len(batch)
-            batch = []
+            flush()
+            pbar.update(args.batch_size)
 
     if batch:
-        ids = [b[0] for b in batch]
-        payloads = [b[1] for b in batch]
-        ttxt = [b[2] for b in batch]
-        vecs = embedder.encode(ttxt, batch_size=args.batch_size, normalize_embeddings=True)
-        points = [
-            PointStruct(id=i, vector=vecs[j].tolist(), payload=payloads[j])
-            for j, i in enumerate(ids)
-        ]
-        client.upsert(collection_name=args.collection, points=points)
-        count += len(batch)
+        flush()
+        pbar.update(len(batch))
 
-    print(f"Ingested ~{count} docs into Qdrant collection '{args.collection}' @ {cfg.url}")
+    pbar.close()
+
+    info = client.get_collection(args.collection)
+    print(f"[ingest_qdrant] DONE points_count={info.points_count}")
+
 
 if __name__ == "__main__":
     main()
