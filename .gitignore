@@ -8,3 +8,7 @@ logs/
 artifacts/
 data/*.jsonl
 *.pkl
+
+# local outputs
+results/
+*.log
