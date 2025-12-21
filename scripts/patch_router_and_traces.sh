@@ -1,3 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+echo "[patch] Writing router model (sklearn>=1.8 compatible + balanced)..."
+cat > src/toolrouter/router/model.py <<'PY'
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+import pickle
+from typing import List, Sequence
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+
+from .actions import Action, DEFAULT_ACTIONS
+
+
+@dataclass
+class RouterModel:
+    pipeline: Pipeline
+    actions: List[Action]
+
+    def predict_action_idx(self, text: str) -> int:
+        return int(self.pipeline.predict([text])[0])
+
+    def predict_action(self, text: str) -> Action:
+        idx = self.predict_action_idx(text)
+        return self.actions[idx]
+
+
+def train_router_model(texts: Sequence[str], labels: Sequence[int], actions: Sequence[Action] = DEFAULT_ACTIONS) -> RouterModel:
+    pipe = Pipeline(
+        steps=[
+            ("tfidf", TfidfVectorizer(ngram_range=(1, 2), max_features=200_000)),
+            # sklearn >= 1.8: avoid multi_class / n_jobs args; use balanced to fight label skew
+            ("clf", LogisticRegression(max_iter=2000, class_weight="balanced")),
+        ]
+    )
+    pipe.fit(list(texts), list(labels))
+    return RouterModel(pipeline=pipe, actions=list(actions))
+
+
+def save_router(model: RouterModel, out_dir: str) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "router.pkl")
+    with open(path, "wb") as f:
+        pickle.dump(model, f)
+
+
+def load_router(dir_path: str) -> RouterModel:
+    path = os.path.join(dir_path, "router.pkl")
+    with open(path, "rb") as f:
+        return pickle.load(f)
+PY
+
+echo "[patch] Writing improved KILT trace generator (rank-aware oracle)..."
+cat > scripts/generate_traces_kilt.py <<'PY'
 from __future__ import annotations
 
 import argparse
@@ -12,7 +74,7 @@ from toolrouter.io import read_jsonl, write_jsonl
 from toolrouter.router.actions import DEFAULT_ACTIONS, Action
 from toolrouter.tokenize import simple_tokenize
 from toolrouter.tools.bm25 import load_bm25
-from toolrouter.tools.qdrant_dense import QdrantDenseTool
+from toolrouter.tools.dense import QdrantDenseTool
 
 
 def wiki_id_from_doc_id(doc_id: str) -> str:
@@ -172,9 +234,13 @@ def main() -> None:
             }
         )
 
-    write_jsonl(args.out, traces)
+    write_jsonl(traces, args.out)
     print(f"Wrote {len(traces)} traces -> {args.out}")
 
 
 if __name__ == "__main__":
     main()
+PY
+
+echo "[patch] Done."
+echo "[patch] Now re-run: generate_traces_kilt.py -> train_router.py -> eval_kilt.py"

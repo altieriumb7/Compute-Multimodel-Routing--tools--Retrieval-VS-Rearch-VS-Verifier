@@ -1,39 +1,50 @@
 from __future__ import annotations
+
+from dataclasses import dataclass
 import os
 import pickle
-from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Sequence
 
-import numpy as np
-from sklearn.pipeline import Pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
 
 from .actions import Action, DEFAULT_ACTIONS
+
 
 @dataclass
 class RouterModel:
     pipeline: Pipeline
     actions: List[Action]
 
-    def predict_action(self, question: str) -> Action:
-        idx = int(self.pipeline.predict([question])[0])
+    def predict_action_idx(self, text: str) -> int:
+        return int(self.pipeline.predict([text])[0])
+
+    def predict_action(self, text: str) -> Action:
+        idx = self.predict_action_idx(text)
         return self.actions[idx]
 
-def train_router_model(texts: List[str], labels: List[int], actions: List[Action] | None = None) -> RouterModel:
-    actions = actions or DEFAULT_ACTIONS
-    pipe = Pipeline([
-        ("tfidf", TfidfVectorizer(ngram_range=(1,2), max_features=50000, lowercase=True)),
-        ("clf", LogisticRegression(max_iter=2000, n_jobs=1, multi_class="auto")),
-    ])
-    pipe.fit(texts, labels)
-    return RouterModel(pipeline=pipe, actions=actions)
+
+def train_router_model(texts: Sequence[str], labels: Sequence[int], actions: Sequence[Action] = DEFAULT_ACTIONS) -> RouterModel:
+    pipe = Pipeline(
+        steps=[
+            ("tfidf", TfidfVectorizer(ngram_range=(1, 2), max_features=200_000)),
+            # sklearn >= 1.8: avoid multi_class / n_jobs args; use balanced to fight label skew
+            ("clf", LogisticRegression(max_iter=2000, class_weight="balanced")),
+        ]
+    )
+    pipe.fit(list(texts), list(labels))
+    return RouterModel(pipeline=pipe, actions=list(actions))
+
 
 def save_router(model: RouterModel, out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "router.pkl"), "wb") as f:
+    path = os.path.join(out_dir, "router.pkl")
+    with open(path, "wb") as f:
         pickle.dump(model, f)
 
+
 def load_router(dir_path: str) -> RouterModel:
-    with open(os.path.join(dir_path, "router.pkl"), "rb") as f:
+    path = os.path.join(dir_path, "router.pkl")
+    with open(path, "rb") as f:
         return pickle.load(f)
