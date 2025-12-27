@@ -1,0 +1,212 @@
+
+import argparse, csv
+import time
+from collections import Counter
+from tqdm import tqdm
+from qdrant_client import QdrantClient
+from sentence_transformers import SentenceTransformer
+
+
+_t0_global = time.time()
+
+def _ts(msg):
+    print(f"[time] {msg}: {time.time()-_t0_global:.2f}s", flush=True)
+
+from toolrouter.config import QdrantConfig
+from toolrouter.io import read_jsonl
+from toolrouter.tools.bm25 import load_bm25, BM25Tool
+from toolrouter.tools.qdrant_dense import QdrantDenseTool
+from toolrouter.router.model import load_router
+from toolrouter.router.actions import DEFAULT_ACTIONS
+
+
+
+
+DENSE_COST = 0.65  # must match dense avg_cost used for budget gating
+def _docs_cost(res):
+    """Normalize tool output -> (docs:list, cost:float).
+    Supports:
+      - None -> ([], 0.0)
+      - list -> (list, 0.0)
+      - wrapper with .docs and optional .cost
+    """
+    if res is None:
+        return [], 0.0
+    if isinstance(res, list):
+        return res, 0.0
+    docs = getattr(res, "docs", None)
+    if not isinstance(docs, list):
+        docs = []
+    cost = getattr(res, "cost", 0.0)
+    try:
+        cost = float(cost or 0.0)
+    except Exception:
+        cost = 0.0
+    return docs, cost
+
+def wiki_id_from_doc_id(doc_id: str) -> str:
+    s = str(doc_id)
+    return s.split(":", 1)[0] if ":" in s else s
+
+
+def hit_rate(tool, qa, k: int):
+    """Compute page-level hit@k and average tool cost.
+
+    This function is robust to different return types from tools:
+    - [] (failure / no results)
+    - list of docs (each doc may have .wiki_id or be a dict)
+    - an object with attributes: .docs (list) and optionally .cost
+    """
+    hits = 0
+    costs = 0.0
+
+    for ex in qa:
+        q = ex.get("question", "")
+        gold = ex.get("wiki_id", "")
+
+        res = tool.retrieve(q, k=k)
+
+        # Normalize outputs
+        cost = 0.0
+        docs = []
+
+        if res is None:
+            docs = []
+        elif isinstance(res, list):
+            docs = res
+        else:
+            # wrapper object
+            docs = getattr(res, "docs", res)
+            cost = float(getattr(res, "cost", 0.0) or 0.0)
+            if isinstance(docs, list) is False:
+                docs = []
+
+        # Some tools may encode cost per-doc; if wrapper cost missing, try per-doc
+        if cost == 0.0 and isinstance(res, list):
+            # best-effort: if elements have cost, sum it; else 0
+            for d in res:
+                if hasattr(d, "cost"):
+                    try:
+                        cost += float(d.cost)
+                    except Exception:
+                        pass
+
+        costs += cost
+
+        # Extract wiki ids from docs
+        pred_ids = []
+        for d in docs[:k]:
+            if d is None:
+                continue
+            if isinstance(d, dict):
+                wid = d.get("wiki_id") or d.get("id") or d.get("doc_id") or ""
+            else:
+                wid = getattr(d, "wiki_id", "") or getattr(d, "id", "") or getattr(d, "doc_id", "")
+            if wid:
+                pred_ids.append(str(wid).split(":", 1)[0])
+
+        if gold and str(gold) in pred_ids:
+            hits += 1
+
+    n = max(1, len(qa))
+    return hits / n, costs / n
+
+
+def main():
+    _ts('enter main')
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--qa", required=True)
+    ap.add_argument("--bm25", required=True)
+    ap.add_argument("--qdrant_collection", required=True)
+    ap.add_argument("--router", required=True)
+    ap.add_argument("--dense_model", default="sentence-transformers/all-MiniLM-L6-v2")
+    ap.add_argument("--budget", type=float, default=1.0)
+    ap.add_argument("--out_csv", default="results/kilt_metrics.csv")
+    args = ap.parse_args()
+
+    qa = read_jsonl(args.qa)
+
+    bm25 = BM25Tool(load_bm25(args.bm25))
+    # Skip dense setup if budget can't afford dense
+    if args.budget < 0.65:
+        dense = None
+    else:
+        cfg = QdrantConfig()
+    dense = None
+    client = QdrantClient(url=cfg.url, api_key=cfg.api_key)
+    # Build dense tool only if budget can afford it (avoids slow Qdrant calls)
+    if args.budget >= DENSE_COST:
+            embedder = SentenceTransformer(args.dense_model)
+            dense = QdrantDenseTool(client=client, collection=args.qdrant_collection, embedder=embedder)
+
+    router = load_router(args.router)
+
+    rows = []
+
+    for k in (5, 20):
+        hr, ac = hit_rate(bm25, qa, k)
+        rows.append(("bm25", k, hr, ac))
+        if args.budget < 0.65:
+            # Skip dense baselines when budget cannot afford dense retrieval (avoids slow Qdrant calls)
+            continue
+        if dense is None:
+            continue
+        hr, ac = hit_rate(dense, qa, k)
+        rows.append(("dense", k, hr, ac))
+
+    # Router (budget-enforced)
+    hits = 0
+    total_cost = 0.0
+    use = Counter()
+
+    # precompute cheapest non-stop action as fallback
+    tools = {"bm25": bm25, "dense": dense}
+    cheapest = None
+    for ai, a in enumerate(DEFAULT_ACTIONS):
+        if a.tool == "stop": continue
+        c = tools[a.tool].base_cost + tools[a.tool].per_doc_cost * a.k
+        if cheapest is None or c < cheapest[0]:
+            cheapest = (c, a)
+
+    t0_loop = time.time()
+    for i, ex in enumerate(tqdm(qa, desc="Eval router")):
+        if i and i % 100 == 0:
+            dt = time.time() - t0_loop
+            print(f"[heartbeat] i={i}/{len(qa)} avg={(dt/i):.4f}s/it", flush=True)
+        gold = set(ex.get("gold_wikipedia_ids") or [])
+        a = router.predict_action(ex["question"])
+
+        if a.tool == "stop":
+            use["stop"] += 1
+            continue
+
+        res = tools[a.tool].retrieve(ex["question"], a.k)
+        if _docs_cost(res)[1] > args.budget:
+            # fallback to cheapest allowed
+            a = cheapest[1]
+            res = tools[a.tool].retrieve(ex["question"], a.k)
+
+        use[a.tool] += 1
+        total_cost += _docs_cost(res)[1]
+        hit = any(wiki_id_from_doc_id(d.doc_id) in gold for d in res.docs)
+        hits += 1 if hit else 0
+
+    router_hr = hits / len(qa)
+    router_ac = total_cost / len(qa)
+    rows.append(("router", -1, router_hr, router_ac))
+
+    with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["system","k","hit_rate","avg_cost"])
+        for r in rows:
+            w.writerow(r)
+
+    print("=== KILT hit@k (page-level) ===")
+    for system,k,hr,ac in rows:
+        if system != "router":
+            print(f"{system}@{k}: hit_rate={hr:.3f} avg_cost={ac:.3f}")
+    print(f"router(budget={args.budget}): hit_rate={router_hr:.3f} avg_cost={router_ac:.3f} usage={dict(use)}")
+    print(f"Wrote CSV: {args.out_csv}")
+
+if __name__ == "__main__":
+    main()

@@ -62,22 +62,19 @@ class QdrantDenseTool:
         raise RuntimeError("QdrantClient has neither query_points nor search.")
 
     def retrieve(self, query: str, k: int) -> ToolResult:
-        try:
-                vec = self.embedder.encode([query], normalize_embeddings=True)[0]
-                res = self._query(vec, int(k))
+        vec = self.embedder.encode([query], normalize_embeddings=True)[0]
+        res = self._query(vec, int(k))
 
-                docs: List[Doc] = []
-                for p in res:
-                    payload = getattr(p, "payload", None) or {}
-                    pid = getattr(p, "id", None)
-                    score = getattr(p, "score", 0.0)
-                    docs.append(Doc(
-                        doc_id=str(payload.get("doc_id", pid)),
-                        title=str(payload.get("title","")),
-                        text=str(payload.get("text","")),
-                        score=float(score),
-                    ))
-                cost = self.base_cost + self.per_doc_cost * max(0, int(k))
-                return ToolResult(docs=docs, cost=cost, meta={"k": int(k)})
-        except Exception as e:
-            return []
+        docs: List[Doc] = []
+        for p in res:
+            payload = getattr(p, "payload", None) or {}
+            pid = getattr(p, "id", None)
+            score = getattr(p, "score", 0.0)
+            docs.append(Doc(
+                doc_id=str(payload.get("doc_id", pid)),
+                title=str(payload.get("title","")),
+                text=str(payload.get("text","")),
+                score=float(score),
+            ))
+        cost = self.base_cost + self.per_doc_cost * max(0, int(k))
+        return ToolResult(docs=docs, cost=cost, meta={"k": int(k)})
