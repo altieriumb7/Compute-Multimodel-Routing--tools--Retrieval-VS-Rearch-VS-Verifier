@@ -1,6 +1,46 @@
 from __future__ import annotations
+import json
+
+def _load_done_ids(path: str) -> set[str]:
+    done = set()
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ex = json.loads(line)
+                    if 'id' in ex:
+                        done.add(str(ex['id']))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return done
+
 
 import argparse
+
+def load_done_ids(path):
+    done = set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ex = json.loads(line)
+                    qid = ex.get("id")
+                    if qid is not None:
+                        done.add(str(qid))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return done
+
 import os
 from typing import Dict, List, Set, Tuple
 
@@ -98,8 +138,17 @@ def main() -> None:
     max_k = max((a.k for a in actions if a.tool != "stop"), default=20)
 
     qa = read_jsonl(args.qa)
-    traces = []
+    done_ids = _load_done_ids(args.out)
+    if done_ids:
+        print(f"[resume] skipping {len(done_ids)} already-written traces")
+    out_f = open(args.out, 'a', encoding='utf-8')
 
+
+    done_ids = load_done_ids(args.out)
+    if done_ids:
+        print(f"[resume] found {len(done_ids)} existing traces in {args.out}, resuming...")
+
+    traces = []
     # small helpers to build docs like the tools do
     def bm25_topk(question: str, k: int):
         q = simple_tokenize(question)
@@ -139,8 +188,24 @@ def main() -> None:
         return docs, float(cost)
 
     for ex in tqdm(qa, desc="Generating KILT traces"):
-        question = ex["question"]
-        gold = set(map(str, ex.get("gold_wikipedia_ids", [])))
+        if str(ex.get("id")) in done_ids:
+            continue
+        if str(ex.get("id")) in done_ids:
+            continue
+        # KILT uses 'input' for the question
+        question = ex.get("input") or ex.get("question") or ex.get("query") or (ex.get("meta", {}) or {}).get("question")
+        if not question:
+            continue
+
+        # Gold Wikipedia ids from KILT output/provenance
+        gold = set()
+        for o in ex.get("output", []):
+            for prov in (o.get("provenance") or []):
+                wid = prov.get("wikipedia_id")
+                if wid is not None:
+                    gold.add(str(wid))
+        if not gold:
+            continue
 
         # compute once per query
         bm25_docs_max, _ = bm25_topk(question, max_k)
@@ -163,7 +228,7 @@ def main() -> None:
 
         label_idx = pick_best_action(actions, results, gold, args.budget)
 
-        traces.append(
+        trace_item = (
             {
                 "id": ex.get("id", ""),
                 "question": question,
@@ -172,8 +237,15 @@ def main() -> None:
             }
         )
 
+        traces.append(trace_item)
+        out_f.write(json.dumps(trace_item, ensure_ascii=False) + "\n")
+        done_ids.add(str(trace_item.get('id')))
+        out_f.flush()
     write_jsonl(args.out, traces)
+    f_out.close()
+    out_f.close()
     print(f"Wrote {len(traces)} traces -> {args.out}")
+
 
 
 if __name__ == "__main__":

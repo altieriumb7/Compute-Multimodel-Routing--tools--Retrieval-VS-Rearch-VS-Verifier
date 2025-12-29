@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -27,57 +28,58 @@ class QdrantDenseTool:
         self.per_doc_cost = float(per_doc_cost)
         self.query_filter = query_filter
 
-    def _query(self, vec, k: int):
-        if hasattr(self.client, "query_points"):
+
+    def _query(self, vec, k):
+
+        # Robust remote call with retries for transient Qdrant issues
+
+        last_err = None
+
+        for attempt in range(12):
+
             try:
-                res = self.client.query_points(
+
+                return self.client.query_points(
+
                     collection_name=self.collection,
+
                     query=vec,
-                    limit=k,
-                    query_filter=self.query_filter,
+
+                    limit=int(k),
+
                     with_payload=True,
+
                     with_vectors=False,
+
                 )
-            except TypeError:
-                res = self.client.query_points(
-                    collection_name=self.collection,
-                    query=vec,
-                    limit=k,
-                    filter=self.query_filter,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-            return getattr(res, "points", res)
 
-        if hasattr(self.client, "search"):
-            return self.client.search(
-                collection_name=self.collection,
-                query_vector=vec,
-                limit=k,
-                query_filter=self.query_filter,
-                with_payload=True,
-                with_vectors=False,
-            )
+            except Exception as e:
 
-        raise RuntimeError("QdrantClient has neither query_points nor search.")
+                last_err = e
 
-    def retrieve(self, query: str, k: int) -> ToolResult:
-        try:
-                vec = self.embedder.encode([query], normalize_embeddings=True)[0]
-                res = self._query(vec, int(k))
+                msg = str(e)
 
-                docs: List[Doc] = []
-                for p in res:
-                    payload = getattr(p, "payload", None) or {}
-                    pid = getattr(p, "id", None)
-                    score = getattr(p, "score", 0.0)
-                    docs.append(Doc(
-                        doc_id=str(payload.get("doc_id", pid)),
-                        title=str(payload.get("title","")),
-                        text=str(payload.get("text","")),
-                        score=float(score),
-                    ))
-                cost = self.base_cost + self.per_doc_cost * max(0, int(k))
-                return ToolResult(docs=docs, cost=cost, meta={"k": int(k)})
-        except Exception as e:
-            return []
+                transient = any(t in msg for t in [
+
+                    "502", "Bad Gateway", "503", "Service Unavailable", "504",
+
+                    "timed out", "ConnectTimeout", "ReadTimeout", "ResponseHandlingException",
+
+                    "Connection reset", "RemoteProtocolError",
+                    "ConnectError",
+                    "[Errno 111]",
+                    "Connection refused"
+
+                ])
+
+                if (not transient) or (attempt == 11):
+
+                    raise
+
+                sleep_s = min(60, 2 ** attempt)
+
+                print(f"[qdrant_dense] transient error: {msg[:160]} ... retry in {sleep_s}s ({attempt+1}/12)")
+
+                time.sleep(sleep_s)
+
+        raise last_err
